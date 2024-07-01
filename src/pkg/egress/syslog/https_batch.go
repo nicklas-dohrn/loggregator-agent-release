@@ -10,7 +10,7 @@ import (
 	"code.cloudfoundry.org/loggregator-agent-release/src/pkg/egress"
 )
 
-const BATCHSIZE = 256 * 1024
+const BATCHSIZE = 1024 * 1024
 
 type HTTPSBatchWriter struct {
 	HTTPSWriter
@@ -39,7 +39,7 @@ func NewHTTPSBatchWriter(
 			syslogConverter: c,
 		},
 		batchSize:    BATCHSIZE,
-		sendInterval: 1 * time.Second,
+		sendInterval: 3 * time.Second,
 		egrMsgCount:  0,
 		msgs:         make(chan []byte),
 	}
