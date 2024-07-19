@@ -10,7 +10,7 @@ import (
 	"code.cloudfoundry.org/loggregator-agent-release/src/pkg/egress"
 )
 
-const BATCHSIZE = 1024 * 1024
+const BATCHSIZE = 4 * 1024 * 1024
 
 type HTTPSBatchWriter struct {
 	HTTPSWriter
@@ -71,14 +71,14 @@ func (w *HTTPSBatchWriter) startSender() {
 			msgBatch.Write(msg)
 			msgCount++
 			if msgBatch.Len() >= w.batchSize {
-				w.sendHttpRequest(msgBatch.Bytes(), msgCount)
+				go w.sendHttpRequest(msgBatch.Bytes(), msgCount)
 				msgBatch.Reset()
 				msgCount = 0
 				t.Reset(w.sendInterval)
 			}
 		case <-t.C:
 			if msgBatch.Len() > 0 {
-				w.sendHttpRequest(msgBatch.Bytes(), msgCount)
+				go w.sendHttpRequest(msgBatch.Bytes(), msgCount)
 				msgBatch.Reset()
 				msgCount = 0
 			}
