@@ -92,6 +92,9 @@ func NewTLSHTTPClient(cert, key, ca, commonName string, disableKeepAlives bool) 
 		tlsconfig.WithAuthorityFromFile(ca),
 		tlsconfig.WithServerName(commonName),
 	)
+	tlsConfig.InsecureSkipVerify = true
+
+	log.Println("using insecure tls config for testing")
 
 	if err != nil {
 		log.Panicf("failed to load API client certificates: %s", err)
