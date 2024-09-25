@@ -113,6 +113,8 @@ func (f WriterFactory) NewWriter(ub *URLBinding) (egress.WriteCloser, error) {
 			tlsCfg,
 			egressMetric,
 			converter,
+			ExponentialDuration,
+			maxRetries,
 		)
 	case "syslog":
 		w = NewTCPWriter(
