@@ -15,10 +15,13 @@ const BATCHSIZE = 1024 * 1024
 
 type HTTPSBatchWriter struct {
 	HTTPSWriter
-	msgs         chan []byte
-	batchSize    int
-	sendInterval time.Duration
-	egrMsgCount  float64
+	msgs          chan []byte
+	batchSize     int
+	sendInterval  time.Duration
+	egrMsgCount   float64
+	retryDuration RetryDuration
+	maxRetries    int
+	binding       *URLBinding
 }
 
 func NewHTTPSBatchWriter(
@@ -27,6 +30,8 @@ func NewHTTPSBatchWriter(
 	tlsConf *tls.Config,
 	egressMetric metrics.Counter,
 	c *Converter,
+	retryDuration RetryDuration,
+	maxRetries int,
 ) egress.WriteCloser {
 	client := httpClient(netConf, tlsConf)
 	binding.URL.Scheme = "https" // reset the scheme for usage to a valid http scheme
@@ -39,10 +44,13 @@ func NewHTTPSBatchWriter(
 			egressMetric:    egressMetric,
 			syslogConverter: c,
 		},
-		batchSize:    BATCHSIZE,
-		sendInterval: 1 * time.Second,
-		egrMsgCount:  0,
-		msgs:         make(chan []byte),
+		batchSize:     BATCHSIZE,
+		sendInterval:  1 * time.Second,
+		egrMsgCount:   0,
+		msgs:          make(chan []byte),
+		maxRetries:    maxRetries,
+		retryDuration: retryDuration,
+		binding:       binding,
 	}
 	go BatchWriter.startSender()
 	return BatchWriter
@@ -74,6 +82,23 @@ func (w *HTTPSBatchWriter) startSender() {
 		msgCount = 0
 		t.Reset(w.sendInterval)
 	}
+	sendWithRetry := func() {
+		for i := 0; i < w.maxRetries; i++ {
+			err := w.sendHttpRequest(msgBatch.Bytes(), msgCount)
+			if err == nil {
+				return
+			}
+
+			if egress.ContextDone(w.binding.Context) {
+				log.Printf("Binding context closed for host: %s, err: %s", w.binding.URL.Host, err)
+				return
+			}
+
+			sleepDuration := w.retryDuration(i)
+			log.Printf("Retry triggered for host %s, retrying in %s, err: %s", w.binding.URL.Host, sleepDuration, err)
+			time.Sleep(sleepDuration)
+		}
+	}
 	for {
 		select {
 		case msg := <-w.msgs:
@@ -84,13 +109,13 @@ func (w *HTTPSBatchWriter) startSender() {
 			} else {
 				msgCount++
 				if length >= w.batchSize {
-					w.sendHttpRequest(msgBatch.Bytes(), msgCount) //nolint:errcheck
+					sendWithRetry()
 					reset()
 				}
 			}
 		case <-t.C:
 			if msgBatch.Len() > 0 {
-				w.sendHttpRequest(msgBatch.Bytes(), msgCount) //nolint:errcheck
+				sendWithRetry()
 				reset()
 			}
 		}
