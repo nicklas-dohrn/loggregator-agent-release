@@ -219,7 +219,7 @@ type Server struct {
 
 	concurrencyCh chan struct{}
 
-	idleConns map[net.Conn]time.Time
+	idleConns map[net.Conn]*atomic.Int64
 	done      chan struct{}
 
 	// Server name for sending in response headers.
@@ -621,6 +621,72 @@ type RequestCtx struct {
 	connID           uint64
 	connRequestNum   uint64
 	hijackNoResponse bool
+}
+
+// EarlyHints allows the server to hint to the browser what resources a page would need
+// so the browser can preload them while waiting for the server's full response. Only Link
+// headers already written to the response will be transmitted as Early Hints.
+//
+// This is a HTTP/2+ feature but all browsers will either understand it or safely ignore it.
+//
+// NOTE: Older HTTP/1.1 non-browser clients may face compatibility issues.
+//
+// See: https://developer.chrome.com/docs/web-platform/early-hints and
+// https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Link#syntax
+//
+// Example:
+//
+//	func(ctx *fasthttp.RequestCtx) {
+//	   ctx.Response.Header.Add("Link", "<https://fonts.google.com>; rel=preconnect")
+//	   ctx.EarlyHints()
+//	   time.Sleep(5*time.Second) // some time-consuming task
+//	   ctx.SetStatusCode(fasthttp.StatusOK)
+//	   ctx.SetBody([]byte("<html><head></head><body><h1>Hello from Fasthttp</h1></body></html>"))
+//	}
+func (ctx *RequestCtx) EarlyHints() error {
+	links := ctx.Response.Header.PeekAll(b2s(strLink))
+	if len(links) > 0 {
+		c := acquireWriter(ctx)
+		defer releaseWriter(ctx.s, c)
+		_, err := c.Write(strEarlyHints)
+		if err != nil {
+			return err
+		}
+		for _, l := range links {
+			if len(l) == 0 {
+				continue
+			}
+			_, err = c.Write(strLink)
+			if err != nil {
+				return err
+			}
+			_, err = c.Write(strColon)
+			if err != nil {
+				return err
+			}
+			_, err = c.Write(strSpace)
+			if err != nil {
+				return err
+			}
+			_, err = c.Write(l)
+			if err != nil {
+				return err
+			}
+			_, err = c.Write(strCRLF)
+			if err != nil {
+				return err
+			}
+		}
+		_, err = c.Write(strCRLF)
+		if err != nil {
+			return err
+		}
+		err = c.Flush()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // HijackHandler must process the hijacked connection c.
@@ -1157,7 +1223,7 @@ var (
 	// NetHttpFormValueFunc gives consistent behavior with net/http.
 	// POST and PUT body parameters take precedence over URL query string values.
 	//
-	//nolint:stylecheck // backwards compatibility
+	//nolint:staticcheck // backwards compatibility
 	NetHttpFormValueFunc = func(ctx *RequestCtx, key string) []byte {
 		v := ctx.PostArgs().Peek(key)
 		if len(v) > 0 {
@@ -1704,10 +1770,6 @@ func (s *Server) ServeTLS(ln net.Listener, certFile, keyFile string) error {
 		}
 	}
 
-	// BuildNameToCertificate has been deprecated since 1.14.
-	// But since we also support older versions we'll keep this here.
-	s.TLSConfig.BuildNameToCertificate() //nolint:staticcheck
-
 	s.mu.Unlock()
 
 	return s.Serve(
@@ -1731,10 +1793,6 @@ func (s *Server) ServeTLSEmbed(ln net.Listener, certData, keyData []byte) error 
 			return err
 		}
 	}
-
-	// BuildNameToCertificate has been deprecated since 1.14.
-	// But since we also support older versions we'll keep this here.
-	s.TLSConfig.BuildNameToCertificate() //nolint:staticcheck
 
 	s.mu.Unlock()
 
@@ -2140,6 +2198,26 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 		return handler(c)
 	}
 
+	s.idleConnsMu.Lock()
+	if s.idleConns == nil {
+		s.idleConns = make(map[net.Conn]*atomic.Int64)
+	}
+	idleConnTime, ok := s.idleConns[c]
+	if !ok {
+		v := idleConnTimePool.Get()
+		if v == nil {
+			v = &atomic.Int64{}
+		}
+		idleConnTime = v.(*atomic.Int64)
+		s.idleConns[c] = idleConnTime
+	}
+
+	// Count the connection as Idle after 5 seconds.
+	// Same as net/http.Server:
+	// https://github.com/golang/go/blob/85d7bab91d9a3ed1f76842e4328973ea75efef54/src/net/http/server.go#L2834-L2836
+	idleConnTime.Store(time.Now().Add(time.Second * 5).Unix())
+	s.idleConnsMu.Unlock()
+
 	serverName := s.getServerName()
 	connRequestNum := uint64(0)
 	connID := nextConnID()
@@ -2214,6 +2292,8 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 
 		if err == nil {
 			s.setState(c, StateActive)
+
+			idleConnTime.Store(0)
 
 			if s.ReadTimeout > 0 {
 				if err = c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
@@ -2493,6 +2573,8 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 			err = nil
 			break
 		}
+
+		idleConnTime.Store(time.Now().Unix())
 	}
 
 	if br != nil {
@@ -2505,11 +2587,18 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 		s.releaseCtx(ctx)
 	}
 
+	s.idleConnsMu.Lock()
+	ic, ok := s.idleConns[c]
+	if ok {
+		idleConnTimePool.Put(ic)
+		delete(s.idleConns, c)
+	}
+	s.idleConnsMu.Unlock()
+
 	return
 }
 
 func (s *Server) setState(nc net.Conn, state ConnState) {
-	s.trackConn(nc, state)
 	if hook := s.ConnState; hook != nil {
 		hook(nc, state)
 	}
@@ -2886,36 +2975,17 @@ func (s *Server) writeErrorResponse(bw *bufio.Writer, ctx *RequestCtx, serverNam
 	return bw
 }
 
-func (s *Server) trackConn(c net.Conn, state ConnState) {
-	s.idleConnsMu.Lock()
-	switch state {
-	case StateIdle:
-		if s.idleConns == nil {
-			s.idleConns = make(map[net.Conn]time.Time)
-		}
-		s.idleConns[c] = time.Now()
-	case StateNew:
-		if s.idleConns == nil {
-			s.idleConns = make(map[net.Conn]time.Time)
-		}
-		// Count the connection as Idle after 5 seconds.
-		// Same as net/http.Server:
-		// https://github.com/golang/go/blob/85d7bab91d9a3ed1f76842e4328973ea75efef54/src/net/http/server.go#L2834-L2836
-		s.idleConns[c] = time.Now().Add(time.Second * 5)
-
-	default:
-		delete(s.idleConns, c)
-	}
-	s.idleConnsMu.Unlock()
-}
+var idleConnTimePool sync.Pool
 
 func (s *Server) closeIdleConns() {
 	s.idleConnsMu.Lock()
-	now := time.Now()
-	for c, t := range s.idleConns {
-		if now.Sub(t) >= 0 {
+	now := time.Now().Unix()
+	for c, ict := range s.idleConns {
+		t := ict.Load()
+		if t != 0 && now-t >= 0 {
 			_ = c.Close()
 			delete(s.idleConns, c)
+			idleConnTimePool.Put(ict)
 		}
 	}
 	s.idleConnsMu.Unlock()
