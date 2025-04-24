@@ -56,7 +56,7 @@ func NewHTTPSBatchWriter(
 			syslogConverter: c,
 		},
 		batchSize:    256 * 1024,        // Default value
-		sendInterval: 1 * time.Second,   // Default value
+		sendInterval: 10 * time.Second,  // Default value
 		msgChan:      make(chan []byte), // Buffered channel for messages
 		quit:         make(chan struct{}),
 	}
@@ -64,7 +64,7 @@ func NewHTTPSBatchWriter(
 	for _, opt := range options {
 		opt(writer)
 	}
-
+	log.Printf("Creating batch writer for target: %s", binding.URL.String())
 	writer.wg.Add(1)
 	go writer.startSender()
 
@@ -96,7 +96,10 @@ func (w *HTTPSBatchWriter) startSender() {
 
 	sendBatch := func() {
 		if msgBatch.Len() > 0 {
-			w.sendHttpRequest(msgBatch.Bytes(), msgCount) // nolint:errcheck
+			err := w.sendHttpRequest(msgBatch.Bytes(), msgCount) // nolint:errcheck
+			if err != nil {
+				log.Printf("Failed to send batch, dropping batch of size %d , err: %s", int(msgCount), err)
+			}
 			msgBatch.Reset()
 			msgCount = 0
 		}
@@ -126,6 +129,7 @@ func (w *HTTPSBatchWriter) startSender() {
 }
 
 func (w *HTTPSBatchWriter) Close() error {
+	log.Printf("Closing batch writer for target: %s", w.url.String())
 	close(w.quit)
 	w.wg.Wait() // Ensure sender finishes processing before closing
 	close(w.msgChan)

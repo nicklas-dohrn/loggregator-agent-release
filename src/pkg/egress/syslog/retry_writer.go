@@ -49,10 +49,6 @@ func (r *RetryWriter) Write(e *loggregator_v2.Envelope) error {
 			return nil
 		}
 
-		if egress.ContextDone(r.binding.Context) {
-			return err
-		}
-
 		sleepDuration := r.retryDuration(i)
 		log.Printf(logTemplate, r.binding.URL.Host, sleepDuration, err)
 

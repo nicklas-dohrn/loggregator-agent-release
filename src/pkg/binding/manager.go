@@ -294,7 +294,10 @@ func (m *Manager) copyDrains() []drainHolder {
 }
 
 func closeDrains(drainsToBeClosed []drainHolder) {
+	var i = 0
 	for _, drainHolder := range drainsToBeClosed {
+		log.Printf("closing drain number: %d", i)
+		i++
 		drainHolder.cancel()
 	}
 }
