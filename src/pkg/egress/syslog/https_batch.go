@@ -35,7 +35,7 @@ func NewRetryer(
 	}
 }
 
-func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, float64) error) error {
+func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, float64) error) {
 	logTemplate := "failed to write to %s, retrying in %s, err: %s"
 
 	var err error
@@ -43,12 +43,12 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, fl
 	for i := 0; i <= r.maxRetries; i++ {
 		err = function(batch, msgCount)
 		if err == nil {
-			return nil // Success
+			return
 		}
 
 		if egress.ContextDone(r.binding.Context) {
 			log.Printf("Context cancelled for %s, aborting retries", r.binding.URL.Host)
-			return err
+			return
 		}
 
 		sleepDuration := r.retryDuration(i)
@@ -58,7 +58,7 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, fl
 	}
 
 	log.Printf("Exhausted retries for %s, dropping batch, err: %s", r.binding.URL.Host, err)
-	return err
+	return
 }
 
 type HTTPSBatchWriter struct {
