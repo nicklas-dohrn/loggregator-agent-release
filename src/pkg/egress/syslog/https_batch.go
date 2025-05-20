@@ -58,7 +58,6 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, fl
 	}
 
 	log.Printf("Exhausted retries for %s, dropping batch, err: %s", r.binding.URL.Host, err)
-	return
 }
 
 type HTTPSBatchWriter struct {

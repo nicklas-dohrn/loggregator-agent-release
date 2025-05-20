@@ -34,17 +34,16 @@ var _ = Describe("Retryer", func() {
 	})
 
 	It("retries the specified number of times on failure", func() {
-		err := retryer.Retry([]byte("test-batch"), 10, func(batch []byte, msgCount float64) error {
+		retryer.Retry([]byte("test-batch"), 10, func(batch []byte, msgCount float64) error {
 			retryAttempts++
 			return errors.New("test error")
 		})
 
-		Expect(err).To(HaveOccurred())
 		Expect(retryAttempts).To(Equal(4)) // Retries up to maxRetries
 	})
 
 	It("stops retrying when the function succeeds", func() {
-		err := retryer.Retry([]byte("test-batch"), 10, func(batch []byte, msgCount float64) error {
+		retryer.Retry([]byte("test-batch"), 10, func(batch []byte, msgCount float64) error {
 			retryAttempts++
 			if retryAttempts == 2 {
 				return nil // Succeed on the second attempt
@@ -52,7 +51,6 @@ var _ = Describe("Retryer", func() {
 			return errors.New("test error")
 		})
 
-		Expect(err).ToNot(HaveOccurred())
 		Expect(retryAttempts).To(Equal(2)) // Stops after success
 	})
 
@@ -66,22 +64,19 @@ var _ = Describe("Retryer", func() {
 			}, 3)
 
 		cancel() // Cancel the context
-		err := retryer.Retry([]byte("test-batch"), 10, func(batch []byte, msgCount float64) error {
+		retryer.Retry([]byte("test-batch"), 10, func(batch []byte, msgCount float64) error {
 			retryAttempts++
 			return errors.New("test error")
 		})
-		Eventually(err, time.Millisecond*100).Should(HaveOccurred())
 		Expect(retryAttempts).To(Equal(1)) // Only one attempt due to context cancellation
 	})
 
 	It("returns the last error after exhausting retries", func() {
-		finalError := errors.New("final error")
-		err := retryer.Retry([]byte("test-batch"), 10, func(batch []byte, msgCount float64) error {
+		retryer.Retry([]byte("test-batch"), 10, func(batch []byte, msgCount float64) error {
 			retryAttempts++
-			return finalError
+			return errors.New("test error")
 		})
 
-		Expect(err).To(Equal(finalError))
 		Expect(retryAttempts).To(Equal(4)) // Retries up to maxRetries
 	})
 })
