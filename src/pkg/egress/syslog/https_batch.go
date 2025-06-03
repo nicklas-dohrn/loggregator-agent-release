@@ -114,9 +114,9 @@ func NewHTTPSBatchWriter(
 		retryer: Retryer{
 			binding: binding,
 		},
-		batchSize:    256 * 1024,        // Default value
-		sendInterval: 1 * time.Second,   // Default value
-		msgChan:      make(chan []byte), // Buffered channel for messages
+		batchSize:    256 * 1024,              // Default value
+		sendInterval: 1 * time.Second,         // Default value
+		msgChan:      make(chan []byte, 1024), // Buffered channel for messages
 		quit:         make(chan struct{}),
 	}
 
