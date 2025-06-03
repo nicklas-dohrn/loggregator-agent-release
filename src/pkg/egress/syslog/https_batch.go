@@ -2,6 +2,7 @@ package syslog
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"log"
 	"sync"
@@ -13,16 +14,22 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+// InternalRetryWriter configures retry behavior for writers that support retries.
 type InternalRetryWriter interface {
 	ConfigureRetry(retryDuration RetryDuration, maxRetries int)
 }
 
+// RetryDuration defines a function to calculate retry delay based on attempt number.
+type RetryDuration func(attempt int) time.Duration
+
+// Retryer performs retry logic with backoff and max retries.
 type Retryer struct {
 	retryDuration RetryDuration
 	maxRetries    int
 	binding       *URLBinding
 }
 
+// NewRetryer returns a Retryer configured with binding, retry duration function, and max retries.
 func NewRetryer(
 	binding *URLBinding,
 	retryDuration RetryDuration,
@@ -35,62 +42,69 @@ func NewRetryer(
 	}
 }
 
-func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, float64) error) {
-	logTemplate := "failed to write to %s, retrying in %s, err: %s"
+// Retry executes the function with retries on failure, respecting context cancellation.
+func (r *Retryer) Retry(ctx context.Context, batch []byte, msgCount float64, function func([]byte, float64) error) {
+	const logTemplate = "failed to write to %s, retrying in %s, err: %v"
 
 	var err error
-
 	for i := 0; i <= r.maxRetries; i++ {
 		err = function(batch, msgCount)
 		if err == nil {
 			return
 		}
 
-		if egress.ContextDone(r.binding.Context) {
+		select {
+		case <-ctx.Done():
 			log.Printf("Context cancelled for %s, aborting retries", r.binding.URL.Host)
 			return
+		default:
 		}
 
 		sleepDuration := r.retryDuration(i)
 		log.Printf(logTemplate, r.binding.URL.Host, sleepDuration, err)
-
 		time.Sleep(sleepDuration)
 	}
 
-	log.Printf("Exhausted retries for %s, dropping batch, err: %s", r.binding.URL.Host, err)
+	log.Printf("Exhausted retries for %s, dropping batch, err: %v", r.binding.URL.Host, err)
 }
 
+// HTTPSBatchWriter batches messages and sends them over HTTPS with retry logic.
 type HTTPSBatchWriter struct {
 	HTTPSWriter
 	batchSize    int
 	dispatcher   *dispatcher
 	sendInterval time.Duration
-	retryer      Retryer
+	retryer      *Retryer
 	msgChan      chan []byte
 	quit         chan struct{}
 	wg           sync.WaitGroup
+	closeOnce    sync.Once
 }
 
-// Also Marks that HTTPSBatchWriter implements the InternalRetryWriter interface
+// ConfigureRetry updates retry parameters on the HTTPSBatchWriter.
 func (w *HTTPSBatchWriter) ConfigureRetry(retryDuration RetryDuration, maxRetries int) {
 	w.retryer.retryDuration = retryDuration
 	w.retryer.maxRetries = maxRetries
 }
 
+// Option configures HTTPSBatchWriter options.
 type Option func(*HTTPSBatchWriter)
 
+// WithBatchSize sets the batch size limit for HTTPSBatchWriter.
 func WithBatchSize(size int) Option {
 	return func(w *HTTPSBatchWriter) {
 		w.batchSize = size
 	}
 }
 
+// WithSendInterval sets the send interval duration for HTTPSBatchWriter.
 func WithSendInterval(interval time.Duration) Option {
 	return func(w *HTTPSBatchWriter) {
 		w.sendInterval = interval
 	}
 }
 
+// NewHTTPSBatchWriter creates and initializes an HTTPSBatchWriter.
 func NewHTTPSBatchWriter(
 	binding *URLBinding,
 	netConf NetworkTimeoutConfig,
@@ -111,11 +125,12 @@ func NewHTTPSBatchWriter(
 			egressMetric:    egressMetric,
 			syslogConverter: c,
 		},
-		retryer: Retryer{
+		retryer: &Retryer{
 			binding: binding,
+			// Default retryDuration and maxRetries can be set here or configured later
 		},
-		batchSize:    256 * 1024,              // Default value
-		sendInterval: 1 * time.Second,         // Default value
+		batchSize:    256 * 1024,              // Default batch size: 256KB
+		sendInterval: 1 * time.Second,         // Default send interval: 1s
 		msgChan:      make(chan []byte, 1024), // Buffered channel for messages
 		quit:         make(chan struct{}),
 	}
@@ -144,20 +159,27 @@ func NewHTTPSBatchWriter(
 	return writer
 }
 
+// Write converts an Envelope to syslog messages and queues them for batching.
+// If the msgChan is full, messages are dropped with a warning.
 func (w *HTTPSBatchWriter) Write(env *loggregator_v2.Envelope) error {
 	msgs, err := w.syslogConverter.ToRFC5424(env, w.hostname)
 	if err != nil {
-		log.Printf("Failed to parse syslog, dropping message, err: %s", err)
+		log.Printf("Failed to parse syslog, dropping message, err: %v", err)
 		return nil
 	}
 
 	for _, msg := range msgs {
-		w.msgChan <- msg
+		select {
+		case w.msgChan <- msg:
+		default:
+			log.Printf("msgChan full, dropping message")
+		}
 	}
 
 	return nil
 }
 
+// startSender batches messages and dispatches them at intervals or when batch size limit is reached.
 func (w *HTTPSBatchWriter) startSender() {
 	defer w.wg.Done()
 
@@ -169,8 +191,12 @@ func (w *HTTPSBatchWriter) startSender() {
 
 	sendBatch := func() {
 		if msgBatch.Len() > 0 {
+			// Copy the batch data so the buffer can be reset safely
+			batchCopy := make([]byte, msgBatch.Len())
+			copy(batchCopy, msgBatch.Bytes())
+
 			w.dispatcher.dispatch(batch{
-				data:     msgBatch.Bytes(),
+				data:     batchCopy,
 				msgCount: msgCount,
 			})
 			msgBatch.Reset()
@@ -183,14 +209,14 @@ func (w *HTTPSBatchWriter) startSender() {
 		case msg := <-w.msgChan:
 			_, err := msgBatch.Write(msg)
 			if err != nil {
-				log.Printf("Failed to write to buffer, dropping buffer of size %d , err: %s", msgBatch.Len(), err)
+				log.Printf("Failed to write to buffer, dropping batch of size %d, err: %v", msgBatch.Len(), err)
 				msgBatch.Reset()
 				msgCount = 0
-			} else {
-				msgCount++
-				if msgBatch.Len() >= w.batchSize {
-					sendBatch()
-				}
+				continue
+			}
+			msgCount++
+			if msgBatch.Len() >= w.batchSize {
+				sendBatch()
 			}
 		case <-ticker.C:
 			sendBatch()
@@ -201,16 +227,20 @@ func (w *HTTPSBatchWriter) startSender() {
 	}
 }
 
+// Close gracefully shuts down the HTTPSBatchWriter and stops all workers.
 func (w *HTTPSBatchWriter) Close() error {
-	close(w.quit)
-	w.wg.Wait()
-	close(w.msgChan)
-	if w.dispatcher != nil {
-		w.dispatcher.stop()
-	}
+	w.closeOnce.Do(func() {
+		close(w.quit)
+		w.wg.Wait()
+		close(w.msgChan)
+		if w.dispatcher != nil {
+			w.dispatcher.stop()
+		}
+	})
 	return nil
 }
 
+// httpBatchClient creates a fasthttp.Client with custom timeout configurations.
 func httpBatchClient(netConf NetworkTimeoutConfig, tlsConf *tls.Config) *fasthttp.Client {
 	client := httpClient(netConf, tlsConf)
 	client.MaxIdleConnDuration = 30 * time.Second
@@ -218,24 +248,35 @@ func httpBatchClient(netConf NetworkTimeoutConfig, tlsConf *tls.Config) *fasthtt
 	return client
 }
 
+// batch represents a batch of bytes to send with message count.
 type batch struct {
 	data     []byte
 	msgCount float64
 }
 
+// worker receives batches from input channel and sends them with retries.
 type worker struct {
 	id      int
 	input   chan batch
-	retryer Retryer
+	retryer *Retryer
 	writer  *HTTPSBatchWriter
 }
 
+// start listens on input channel and sends batches with retry logic.
+func (w *worker) start() {
+	for b := range w.input {
+		w.retryer.Retry(w.retryer.binding.Context, b.data, b.msgCount, w.writer.sendHttpRequest)
+	}
+}
+
+// dispatcher distributes batches to workers in a round-robin fashion.
 type dispatcher struct {
 	workers    []*worker
 	nextWorker int
 	mu         sync.Mutex
 }
 
+// dispatch sends a batch to the next worker in round-robin order.
 func (d *dispatcher) dispatch(b batch) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -244,28 +285,9 @@ func (d *dispatcher) dispatch(b batch) {
 	w.input <- b
 }
 
+// stop closes all workers' input channels to stop processing.
 func (d *dispatcher) stop() {
 	for _, w := range d.workers {
 		close(w.input)
-	}
-}
-
-func (w *worker) start() {
-	for b := range w.input {
-		for i := 0; i <= w.retryer.maxRetries; i++ {
-			err := w.writer.sendHttpRequest(b.data, b.msgCount)
-			if err == nil {
-				break
-			}
-
-			if egress.ContextDone(w.retryer.binding.Context) {
-				log.Printf("Context cancelled for %s, aborting retries", w.retryer.binding.URL.Host)
-				break
-			}
-
-			sleep := w.retryer.retryDuration(i)
-			log.Printf("worker-%d: retrying in %s, err: %s", w.id, sleep, err)
-			time.Sleep(sleep)
-		}
 	}
 }
