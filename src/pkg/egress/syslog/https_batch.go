@@ -63,6 +63,7 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, fl
 type HTTPSBatchWriter struct {
 	HTTPSWriter
 	batchSize    int
+	dispatcher   *dispatcher
 	sendInterval time.Duration
 	retryer      Retryer
 	msgChan      chan []byte
@@ -123,6 +124,20 @@ func NewHTTPSBatchWriter(
 		opt(writer)
 	}
 
+	const numWorkers = 4
+	d := &dispatcher{}
+	for i := 0; i < numWorkers; i++ {
+		wrk := &worker{
+			id:      i,
+			input:   make(chan batch, 5),
+			retryer: writer.retryer,
+			writer:  writer,
+		}
+		go wrk.start()
+		d.workers = append(d.workers, wrk)
+	}
+	writer.dispatcher = d
+
 	writer.wg.Add(1)
 	go writer.startSender()
 
@@ -154,7 +169,10 @@ func (w *HTTPSBatchWriter) startSender() {
 
 	sendBatch := func() {
 		if msgBatch.Len() > 0 {
-			w.retryer.Retry(msgBatch.Bytes(), msgCount, w.sendHttpRequest)
+			w.dispatcher.dispatch(batch{
+				data:     msgBatch.Bytes(),
+				msgCount: msgCount,
+			})
 			msgBatch.Reset()
 			msgCount = 0
 		}
@@ -185,8 +203,11 @@ func (w *HTTPSBatchWriter) startSender() {
 
 func (w *HTTPSBatchWriter) Close() error {
 	close(w.quit)
-	w.wg.Wait() // Ensure sender finishes processing before closing
+	w.wg.Wait()
 	close(w.msgChan)
+	if w.dispatcher != nil {
+		w.dispatcher.stop()
+	}
 	return nil
 }
 
@@ -195,4 +216,56 @@ func httpBatchClient(netConf NetworkTimeoutConfig, tlsConf *tls.Config) *fasthtt
 	client.MaxIdleConnDuration = 30 * time.Second
 	client.MaxConnDuration = 30 * time.Second
 	return client
+}
+
+type batch struct {
+	data     []byte
+	msgCount float64
+}
+
+type worker struct {
+	id      int
+	input   chan batch
+	retryer Retryer
+	writer  *HTTPSBatchWriter
+}
+
+type dispatcher struct {
+	workers    []*worker
+	nextWorker int
+	mu         sync.Mutex
+}
+
+func (d *dispatcher) dispatch(b batch) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	w := d.workers[d.nextWorker]
+	d.nextWorker = (d.nextWorker + 1) % len(d.workers)
+	w.input <- b
+}
+
+func (d *dispatcher) stop() {
+	for _, w := range d.workers {
+		close(w.input)
+	}
+}
+
+func (w *worker) start() {
+	for b := range w.input {
+		for i := 0; i <= w.retryer.maxRetries; i++ {
+			err := w.writer.sendHttpRequest(b.data, b.msgCount)
+			if err == nil {
+				break
+			}
+
+			if egress.ContextDone(w.retryer.binding.Context) {
+				log.Printf("Context cancelled for %s, aborting retries", w.retryer.binding.URL.Host)
+				break
+			}
+
+			sleep := w.retryer.retryDuration(i)
+			log.Printf("worker-%d: retrying in %s, err: %s", w.id, sleep, err)
+			time.Sleep(sleep)
+		}
+	}
 }
