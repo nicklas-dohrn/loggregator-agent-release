@@ -22,6 +22,14 @@ type InternalRetryWriter interface {
 // RetryDuration defines a function to calculate retry delay based on attempt number.
 type RetryDuration func(attempt int) time.Duration
 
+const (
+	defaultMaxRetries    = 5
+	defaultBatchSize     = 256 * 1024 // 256KB
+	defaultSendInterval  = 1 * time.Second
+	defaultNumWorkers    = 4
+	defaultMsgChanBuffer = 1024
+)
+
 // Retryer performs retry logic with backoff and max retries.
 type Retryer struct {
 	retryDuration RetryDuration
@@ -126,12 +134,13 @@ func NewHTTPSBatchWriter(
 			syslogConverter: c,
 		},
 		retryer: &Retryer{
-			binding: binding,
-			// Default retryDuration and maxRetries can be set here or configured later
+			binding:       binding,
+			retryDuration: defaultBackoff,
+			maxRetries:    defaultMaxRetries,
 		},
-		batchSize:    256 * 1024,              // Default batch size: 256KB
-		sendInterval: 1 * time.Second,         // Default send interval: 1s
-		msgChan:      make(chan []byte, 1024), // Buffered channel for messages
+		batchSize:    defaultBatchSize,
+		sendInterval: defaultSendInterval,
+		msgChan:      make(chan []byte, defaultMsgChanBuffer),
 		quit:         make(chan struct{}),
 	}
 
@@ -139,12 +148,11 @@ func NewHTTPSBatchWriter(
 		opt(writer)
 	}
 
-	const numWorkers = 4
 	d := &dispatcher{}
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < defaultNumWorkers; i++ {
 		wrk := &worker{
 			id:      i,
-			input:   make(chan batch, 5),
+			input:   make(chan batch, 5), // buffered to prevent blocking dispatcher
 			retryer: writer.retryer,
 			writer:  writer,
 		}
@@ -173,6 +181,7 @@ func (w *HTTPSBatchWriter) Write(env *loggregator_v2.Envelope) error {
 		case w.msgChan <- msg:
 		default:
 			log.Printf("msgChan full, dropping message")
+			// Consider adding a metric for dropped messages here
 		}
 	}
 
@@ -191,7 +200,6 @@ func (w *HTTPSBatchWriter) startSender() {
 
 	sendBatch := func() {
 		if msgBatch.Len() > 0 {
-			// Copy the batch data so the buffer can be reset safely
 			batchCopy := make([]byte, msgBatch.Len())
 			copy(batchCopy, msgBatch.Bytes())
 
@@ -199,6 +207,7 @@ func (w *HTTPSBatchWriter) startSender() {
 				data:     batchCopy,
 				msgCount: msgCount,
 			})
+
 			msgBatch.Reset()
 			msgCount = 0
 		}
@@ -206,9 +215,12 @@ func (w *HTTPSBatchWriter) startSender() {
 
 	for {
 		select {
-		case msg := <-w.msgChan:
-			_, err := msgBatch.Write(msg)
-			if err != nil {
+		case msg, ok := <-w.msgChan:
+			if !ok {
+				sendBatch()
+				return
+			}
+			if _, err := msgBatch.Write(msg); err != nil {
 				log.Printf("Failed to write to buffer, dropping batch of size %d, err: %v", msgBatch.Len(), err)
 				msgBatch.Reset()
 				msgCount = 0
@@ -230,9 +242,15 @@ func (w *HTTPSBatchWriter) startSender() {
 // Close gracefully shuts down the HTTPSBatchWriter and stops all workers.
 func (w *HTTPSBatchWriter) Close() error {
 	w.closeOnce.Do(func() {
-		close(w.quit)
-		w.wg.Wait()
+		// Close msgChan first to stop Write() from sending more messages
 		close(w.msgChan)
+
+		// Signal startSender to quit after draining remaining messages
+		close(w.quit)
+
+		// Wait for startSender to finish processing
+		w.wg.Wait()
+
 		if w.dispatcher != nil {
 			w.dispatcher.stop()
 		}
@@ -265,7 +283,11 @@ type worker struct {
 // start listens on input channel and sends batches with retry logic.
 func (w *worker) start() {
 	for b := range w.input {
-		w.retryer.Retry(w.retryer.binding.Context, b.data, b.msgCount, w.writer.sendHttpRequest)
+		ctx := context.Background()
+		if w.retryer.binding.Context != nil {
+			ctx = w.retryer.binding.Context
+		}
+		w.retryer.Retry(ctx, b.data, b.msgCount, w.writer.sendHttpRequest)
 	}
 }
 
@@ -290,4 +312,17 @@ func (d *dispatcher) stop() {
 	for _, w := range d.workers {
 		close(w.input)
 	}
+}
+
+// defaultBackoff is a simple exponential backoff function used as default.
+func defaultBackoff(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 100 * time.Millisecond
+	}
+	// Cap max backoff at 5 seconds
+	backoff := time.Duration(100*(1<<attempt)) * time.Millisecond
+	if backoff > 5*time.Second {
+		return 5 * time.Second
+	}
+	return backoff
 }
