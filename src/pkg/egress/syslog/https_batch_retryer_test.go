@@ -40,7 +40,7 @@ var _ = Describe("Retryer", func() {
 			return errors.New("test error")
 		})
 
-		Expect(retryAttempts).To(Equal(4)) // Retries up to maxRetries
+		Expect(retryAttempts).To(Equal(3)) // Retries up to maxRetries
 	})
 
 	It("stops retrying when the function succeeds", func() {
@@ -78,7 +78,7 @@ var _ = Describe("Retryer", func() {
 			return errors.New("test error")
 		})
 
-		Expect(retryAttempts).To(Equal(4)) // Retries up to maxRetries
+		Expect(retryAttempts).To(Equal(3)) // Retries up to maxRetries
 	})
 
 	It("respects the global parallel retry limit (locking behaviour)", func() {

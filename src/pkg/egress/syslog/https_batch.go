@@ -21,13 +21,11 @@ type RetryCoordinator struct {
 var (
 	globalRetryCoordinator     *RetryCoordinator
 	globalRetryCoordinatorOnce sync.Once
-	maxParallelRetries         = 1 // Default, can be overridden for tests
+	maxParallelRetries         = 2
 )
 
-// WithParallelRetries allows tests to set the number of parallel retries.
 func WithParallelRetries(n int) {
 	maxParallelRetries = n
-	// Reset the singleton for test
 	globalRetryCoordinatorOnce = sync.Once{}
 	globalRetryCoordinator = nil
 }
