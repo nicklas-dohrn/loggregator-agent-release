@@ -3,6 +3,7 @@ package syslog_test
 import (
 	"errors"
 	"net/url"
+	"sync"
 	"time"
 
 	"code.cloudfoundry.org/loggregator-agent-release/src/pkg/egress/syslog"
@@ -78,5 +79,54 @@ var _ = Describe("Retryer", func() {
 		})
 
 		Expect(retryAttempts).To(Equal(4)) // Retries up to maxRetries
+	})
+
+	It("respects the global parallel retry limit (locking behaviour)", func() {
+		syslog.WithParallelRetries(2)
+		coordinator := syslog.GetGlobalRetryCoordinator()
+
+		var (
+			started sync.WaitGroup
+			blocked sync.WaitGroup
+			done    sync.WaitGroup
+		)
+
+		started.Add(2)
+		blocked.Add(1)
+		done.Add(2)
+
+		// First two retriers should acquire slots
+		go func() {
+			started.Done()
+			coordinator.Acquire()
+			blocked.Wait()
+			coordinator.Release()
+			done.Done()
+		}()
+		go func() {
+			started.Done()
+			coordinator.Acquire()
+			blocked.Wait()
+			coordinator.Release()
+			done.Done()
+		}()
+
+		started.Wait()
+
+		// Third retrier should block until a slot is released
+		acquired := make(chan struct{})
+		go func() {
+			coordinator.Acquire()
+			close(acquired)
+			coordinator.Release()
+		}()
+
+		Consistently(acquired, 100*time.Millisecond).ShouldNot(BeClosed())
+
+		// Unblock the first two
+		blocked.Done()
+		done.Wait()
+
+		Eventually(acquired, 100*time.Millisecond).Should(BeClosed())
 	})
 })

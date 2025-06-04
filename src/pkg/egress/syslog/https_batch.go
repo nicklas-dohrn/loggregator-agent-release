@@ -13,6 +13,42 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+// --- Coordinator definition ---
+type RetryCoordinator struct {
+	sem chan struct{}
+}
+
+var (
+	globalRetryCoordinator     *RetryCoordinator
+	globalRetryCoordinatorOnce sync.Once
+	maxParallelRetries         = 1 // Default, can be overridden for tests
+)
+
+// WithParallelRetries allows tests to set the number of parallel retries.
+func WithParallelRetries(n int) {
+	maxParallelRetries = n
+	// Reset the singleton for test
+	globalRetryCoordinatorOnce = sync.Once{}
+	globalRetryCoordinator = nil
+}
+
+func GetGlobalRetryCoordinator() *RetryCoordinator {
+	globalRetryCoordinatorOnce.Do(func() {
+		globalRetryCoordinator = &RetryCoordinator{
+			sem: make(chan struct{}, maxParallelRetries),
+		}
+	})
+	return globalRetryCoordinator
+}
+
+func (c *RetryCoordinator) Acquire() {
+	c.sem <- struct{}{}
+}
+
+func (c *RetryCoordinator) Release() {
+	<-c.sem
+}
+
 type InternalRetryWriter interface {
 	ConfigureRetry(retryDuration RetryDuration, maxRetries int)
 }
@@ -21,6 +57,7 @@ type Retryer struct {
 	retryDuration RetryDuration
 	maxRetries    int
 	binding       *URLBinding
+	coordinator   *RetryCoordinator
 }
 
 func NewRetryer(
@@ -32,29 +69,45 @@ func NewRetryer(
 		retryDuration: retryDuration,
 		maxRetries:    maxRetries,
 		binding:       binding,
+		coordinator:   GetGlobalRetryCoordinator(),
 	}
 }
 
 func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, float64) error) {
 	logTemplate := "failed to write to %s, retrying in %s, err: %s"
-
 	var err error
 
-	for i := 0; i <= r.maxRetries; i++ {
-		err = function(batch, msgCount)
-		if err == nil {
-			return
-		}
+	// First attempt (fast path, not counted as a retry)
+	err = function(batch, msgCount)
+	if err == nil {
+		return
+	}
+
+	if egress.ContextDone(r.binding.Context) {
+		log.Printf("Context cancelled for %s, aborting retries", r.binding.URL.Host)
+		return
+	}
+
+	log.Printf(logTemplate, r.binding.URL.Host, r.retryDuration(0), err)
+
+	// Now acquire a global retry slot for subsequent retries
+	r.coordinator.Acquire()
+	defer r.coordinator.Release()
+
+	for i := 0; i < r.maxRetries-1; i++ {
+		sleepDuration := r.retryDuration(i)
+		time.Sleep(sleepDuration)
 
 		if egress.ContextDone(r.binding.Context) {
 			log.Printf("Context cancelled for %s, aborting retries", r.binding.URL.Host)
 			return
 		}
 
-		sleepDuration := r.retryDuration(i)
-		log.Printf(logTemplate, r.binding.URL.Host, sleepDuration, err)
-
-		time.Sleep(sleepDuration)
+		err = function(batch, msgCount)
+		if err == nil {
+			return
+		}
+		log.Printf(logTemplate, r.binding.URL.Host, r.retryDuration(i+1), err)
 	}
 
 	log.Printf("Exhausted retries for %s, dropping batch, err: %s", r.binding.URL.Host, err)
@@ -115,7 +168,7 @@ func NewHTTPSBatchWriter(
 		},
 		batchSize:    256 * 1024,        // Default value
 		sendInterval: 1 * time.Second,   // Default value
-		msgChan:      make(chan []byte), // Buffered channel for messages
+		msgChan:      make(chan []byte), // blocking single message channel for backpressure
 		quit:         make(chan struct{}),
 	}
 
