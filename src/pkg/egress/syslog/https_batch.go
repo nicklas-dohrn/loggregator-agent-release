@@ -24,6 +24,7 @@ var (
 	maxParallelRetries         = 2
 )
 
+// testing override for maxParallelRetries
 func WithParallelRetries(n int) {
 	maxParallelRetries = n
 	globalRetryCoordinatorOnce = sync.Once{}
@@ -72,7 +73,6 @@ func NewRetryer(
 }
 
 func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, float64) error) {
-	logTemplate := "failed to write to %s, retrying in %s, err: %s"
 	var err error
 
 	// First attempt (fast path, not counted as a retry)
@@ -86,7 +86,7 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, fl
 		return
 	}
 
-	log.Printf(logTemplate, r.binding.URL.Host, r.retryDuration(0), err)
+	log.Printf("failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(0), err)
 
 	// Now acquire a global retry slot for subsequent retries
 	r.coordinator.Acquire()
@@ -105,7 +105,7 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, fl
 		if err == nil {
 			return
 		}
-		log.Printf(logTemplate, r.binding.URL.Host, r.retryDuration(i+1), err)
+		log.Printf("failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(i+1), err)
 	}
 
 	log.Printf("Exhausted retries for %s, dropping batch, err: %s", r.binding.URL.Host, err)
@@ -129,18 +129,27 @@ func (w *HTTPSBatchWriter) ConfigureRetry(retryDuration RetryDuration, maxRetrie
 
 type Option func(*HTTPSBatchWriter)
 
+// testing override for batch size and send interval
 func WithBatchSize(size int) Option {
 	return func(w *HTTPSBatchWriter) {
 		w.batchSize = size
 	}
 }
-
 func WithSendInterval(interval time.Duration) Option {
 	return func(w *HTTPSBatchWriter) {
 		w.sendInterval = interval
 	}
 }
 
+// --- HTTPSBatchWriter definition ---
+
+// HTTPSBatchWriter is an egress.WriteCloser implementation that batches syslog messages
+// and sends them via HTTPS in configurable batch sizes and intervals. It provides
+// backpressure to upstream callers by using a blocking channel for incoming messages.
+// Failed batch sends are retried according to a configurable retry policy, using a
+// global RetryCoordinator to limit the number of concurrent retries across all drains.
+// This prevents resource exhaustion and noisy neighbor issues, ensuring reliable and
+// efficient delivery of batched syslog messages.
 func NewHTTPSBatchWriter(
 	binding *URLBinding,
 	netConf NetworkTimeoutConfig,
