@@ -15,33 +15,33 @@ import (
 
 // --- Coordinator definition ---
 type RetryCoordinator struct {
-	sem chan struct{}
+	sem chan int
 }
 
 var (
 	globalRetryCoordinator     *RetryCoordinator
 	globalRetryCoordinatorOnce sync.Once
-	maxParallelRetries         = 2
+	maxParallelRetries         = 4
 )
 
 // testing override for maxParallelRetries
 func WithParallelRetries(n int) {
-	maxParallelRetries = n
-	globalRetryCoordinatorOnce = sync.Once{}
-	globalRetryCoordinator = nil
+	globalRetryCoordinator = &RetryCoordinator{
+		sem: make(chan int, n),
+	}
 }
 
 func GetGlobalRetryCoordinator() *RetryCoordinator {
 	globalRetryCoordinatorOnce.Do(func() {
 		globalRetryCoordinator = &RetryCoordinator{
-			sem: make(chan struct{}, maxParallelRetries),
+			sem: make(chan int, maxParallelRetries),
 		}
 	})
 	return globalRetryCoordinator
 }
 
 func (c *RetryCoordinator) Acquire() {
-	c.sem <- struct{}{}
+	c.sem <- 1
 }
 
 func (c *RetryCoordinator) Release() {
@@ -61,20 +61,22 @@ type Retryer struct {
 
 func NewRetryer(
 	binding *URLBinding,
+	retryDuration RetryDuration,
+	maxRetries int,
 ) *Retryer {
 	return &Retryer{
 		retryDuration: func(attempt int) time.Duration { return 0 },
-		maxRetries:    0,
+		maxRetries:    maxRetries,
 		binding:       binding,
 		coordinator:   GetGlobalRetryCoordinator(),
 	}
 }
 
-func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, float64) error) {
+func (r *Retryer) Retry(batch []byte, msgCount float64, funcToRetry func([]byte, float64) error) {
 	var err error
 
 	// First attempt (fast path, not counted as a retry)
-	err = function(batch, msgCount)
+	err = funcToRetry(batch, msgCount)
 	if err == nil {
 		return
 	}
@@ -86,25 +88,23 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, function func([]byte, fl
 
 	log.Printf("failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(0), err)
 
-	// Now acquire a global retry slot for subsequent retries
-	r.coordinator.Acquire()
-	defer r.coordinator.Release()
-
 	for i := 0; i < r.maxRetries-1; i++ {
-		log.Printf("Number of retry attempts: %d, msg count: %.0f", i+1, msgCount)
 		sleepDuration := r.retryDuration(i)
 		time.Sleep(sleepDuration)
 
+		// Retry attempts need to acquire a concurrent slot
+		r.coordinator.Acquire()
 		if egress.ContextDone(r.binding.Context) {
 			log.Printf("Context cancelled for %s, aborting retries", r.binding.URL.Host)
 			return
 		}
 
-		err = function(batch, msgCount)
+		err = funcToRetry(batch, msgCount)
 		if err == nil {
 			return
 		}
 		log.Printf("failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(i+1), err)
+		r.coordinator.Release()
 	}
 
 	log.Printf("Exhausted retries for %s, dropping batch, err: %s", r.binding.URL.Host, err)
@@ -169,7 +169,7 @@ func NewHTTPSBatchWriter(
 			egressMetric:    egressMetric,
 			syslogConverter: c,
 		},
-		retryer:      *NewRetryer(binding),
+		retryer:      *NewRetryer(binding, func(attempt int) time.Duration { return 0 }, 0),
 		batchSize:    256 * 1024,        // Default value
 		sendInterval: 1 * time.Second,   // Default value
 		msgChan:      make(chan []byte), // blocking single message channel for backpressure

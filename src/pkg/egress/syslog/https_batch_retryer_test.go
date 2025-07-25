@@ -17,10 +17,17 @@ var _ = Describe("Retryer", func() {
 		retryer       *syslog.Retryer
 		retryAttempts int
 		binding       *syslog.URLBinding
+		coordinator   *syslog.RetryCoordinator
+		retryInterval time.Duration
+		waitTime      time.Duration
 	)
 
 	BeforeEach(func() {
 		retryAttempts = 0
+		retryInterval = 10 * time.Millisecond
+		waitTime = retryInterval * 5
+		syslog.WithParallelRetries(2)
+		coordinator = syslog.GetGlobalRetryCoordinator()
 		binding = &syslog.URLBinding{
 			URL: &url.URL{
 				Host: "test-host",
@@ -30,14 +37,14 @@ var _ = Describe("Retryer", func() {
 		retryer = syslog.NewRetryer(
 			binding,
 			func(attempt int) time.Duration {
-				return 10 * time.Millisecond
+				return retryInterval
 			}, 3)
 	})
 
 	It("retries the specified number of times on failure", func() {
 		retryer.Retry([]byte("test-batch"), 10, func(batch []byte, msgCount float64) error {
 			retryAttempts++
-			return errors.New("test error")
+			return errors.New("wtf")
 		})
 
 		Expect(retryAttempts).To(Equal(3)) // Retries up to maxRetries
@@ -52,7 +59,7 @@ var _ = Describe("Retryer", func() {
 			return errors.New("test error")
 		})
 
-		Expect(retryAttempts).To(Equal(2)) // Stops after success
+		Eventually(retryAttempts, waitTime).Should(Equal(2))
 	})
 
 	It("stops retrying when the context is canceled", func() {
@@ -69,7 +76,7 @@ var _ = Describe("Retryer", func() {
 			retryAttempts++
 			return errors.New("test error")
 		})
-		Expect(retryAttempts).To(Equal(1)) // Only one attempt due to context cancellation
+		Eventually(retryAttempts, waitTime).Should(Equal(1))
 	})
 
 	It("returns the last error after exhausting retries", func() {
@@ -78,12 +85,11 @@ var _ = Describe("Retryer", func() {
 			return errors.New("test error")
 		})
 
-		Expect(retryAttempts).To(Equal(3)) // Retries up to maxRetries
+		Eventually(retryAttempts, waitTime).Should(Equal(3))
 	})
 
 	It("respects the global parallel retry limit (locking behaviour)", func() {
 		syslog.WithParallelRetries(2)
-		coordinator := syslog.GetGlobalRetryCoordinator()
 
 		var (
 			started sync.WaitGroup
@@ -114,7 +120,7 @@ var _ = Describe("Retryer", func() {
 		started.Wait()
 
 		// Third retrier should block until a slot is released
-		acquired := make(chan struct{})
+		acquired := make(chan int)
 		go func() {
 			coordinator.Acquire()
 			close(acquired)
