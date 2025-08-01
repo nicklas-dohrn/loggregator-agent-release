@@ -33,9 +33,11 @@ func WithParallelRetries(n int) {
 
 func GetGlobalRetryCoordinator() *RetryCoordinator {
 	globalRetryCoordinatorOnce.Do(func() {
+
 		globalRetryCoordinator = &RetryCoordinator{
 			sem: make(chan struct{}, maxParallelRetries),
 		}
+		globalRetryCoordinator.StartAsyncMonitor()
 	})
 	return globalRetryCoordinator
 }
@@ -46,6 +48,19 @@ func (c *RetryCoordinator) Acquire() {
 
 func (c *RetryCoordinator) Release() {
 	<-c.sem
+}
+
+func (c *RetryCoordinator) StartAsyncMonitor() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			<-ticker.C
+			open := len(c.sem)
+			capacity := cap(c.sem)
+			log.Printf("[RetryCoordinator %p] Open retries: %d/%d", c, open, capacity)
+		}
+	}()
 }
 
 type InternalRetryWriter interface {
@@ -93,18 +108,19 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, funcToRetry func([]byte,
 		time.Sleep(sleepDuration)
 
 		// Retry attempts need to acquire a concurrent slot
-		r.coordinator.Acquire()
+
 		if egress.ContextDone(r.binding.Context) {
 			log.Printf("Context cancelled for %s, aborting retries", r.binding.URL.Host)
 			return
 		}
-
+		r.coordinator.Acquire()
 		err = funcToRetry(batch, msgCount)
+		r.coordinator.Release()
 		if err == nil {
 			return
 		}
 		log.Printf("failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(i+1), err)
-		r.coordinator.Release()
+
 	}
 
 	log.Printf("Exhausted retries for %s, dropping batch, err: %s", r.binding.URL.Host, err)
