@@ -107,20 +107,20 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, funcToRetry func([]byte,
 		sleepDuration := r.retryDuration(i)
 		time.Sleep(sleepDuration)
 
-		// Retry attempts need to acquire a concurrent slot
-
 		if egress.ContextDone(r.binding.Context) {
 			log.Printf("Context cancelled for %s, aborting retries", r.binding.URL.Host)
 			return
 		}
+
 		r.coordinator.Acquire()
-		err = funcToRetry(batch, msgCount)
-		r.coordinator.Release()
+		func() {
+			defer r.coordinator.Release()
+			err = funcToRetry(batch, msgCount)
+		}()
 		if err == nil {
 			return
 		}
 		log.Printf("failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(i+1), err)
-
 	}
 
 	log.Printf("Exhausted retries for %s, dropping batch, err: %s", r.binding.URL.Host, err)
