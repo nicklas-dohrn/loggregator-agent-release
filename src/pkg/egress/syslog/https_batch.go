@@ -104,8 +104,6 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, funcToRetry func([]byte,
 	log.Printf("failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(0), err)
 
 	for i := 0; i < r.maxRetries-1; i++ {
-		sleepDuration := r.retryDuration(i)
-		time.Sleep(sleepDuration)
 
 		if egress.ContextDone(r.binding.Context) {
 			log.Printf("Context cancelled for %s, aborting retries", r.binding.URL.Host)
@@ -121,6 +119,8 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, funcToRetry func([]byte,
 			return
 		}
 		log.Printf("failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(i+1), err)
+		sleepDuration := r.retryDuration(i)
+		time.Sleep(sleepDuration)
 	}
 
 	log.Printf("Exhausted retries for %s, dropping batch, err: %s", r.binding.URL.Host, err)
