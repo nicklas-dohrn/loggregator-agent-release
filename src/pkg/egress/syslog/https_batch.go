@@ -21,7 +21,7 @@ type RetryCoordinator struct {
 var (
 	globalRetryCoordinator     *RetryCoordinator
 	globalRetryCoordinatorOnce sync.Once
-	maxParallelRetries         = 4
+	maxParallelRetries         = 100
 )
 
 // testing override for maxParallelRetries
