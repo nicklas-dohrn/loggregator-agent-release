@@ -24,7 +24,7 @@ upload_binary() {
     '
 }
 
-for i in {0..16}; do
+for i in {0..15}; do
     upload_binary "diego-cell/$i" &
 done
 
