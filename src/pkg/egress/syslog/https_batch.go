@@ -21,7 +21,7 @@ type RetryCoordinator struct {
 var (
 	globalRetryCoordinator     *RetryCoordinator
 	globalRetryCoordinatorOnce sync.Once
-	maxParallelRetries         = 100
+	maxParallelRetries         = 4
 )
 
 // testing override for maxParallelRetries
@@ -37,32 +37,27 @@ func GetGlobalRetryCoordinator() *RetryCoordinator {
 		globalRetryCoordinator = &RetryCoordinator{
 			sem: make(chan struct{}, maxParallelRetries),
 		}
-		globalRetryCoordinator.StartAsyncMonitor()
 	})
 	return globalRetryCoordinator
 }
 
-func (c *RetryCoordinator) Acquire() {
-	c.sem <- struct{}{} // Block until a slot is available
+func (c *RetryCoordinator) Acquire(URL string) {
+	// Try non-blocking send first
+	select {
+	case c.sem <- struct{}{}:
+		// Slot acquired immediately, return
+		return
+	default:
+		// Channel is full, log warning
+		log.Printf("All retry slots (%d) are in use. Log delivery for %s may be delayed.",
+			maxParallelRetries, URL)
+		// Now do the blocking send
+		c.sem <- struct{}{}
+	}
 }
 
 func (c *RetryCoordinator) Release() {
 	<-c.sem
-}
-
-func (c *RetryCoordinator) StartAsyncMonitor() {
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			<-ticker.C
-			used := len(c.sem)
-			capacity := cap(c.sem)
-			available := capacity - used
-			log.Printf("[RetryCoordinator %p] Retry slots: %d used, %d available (capacity: %d)",
-				c, used, available, capacity)
-		}
-	}()
 }
 
 type InternalRetryWriter interface {
@@ -89,45 +84,49 @@ func NewRetryer(
 	}
 }
 
-func (r *Retryer) Retry(batch []byte, msgCount float64, funcToRetry func([]byte, float64) error) {
+// Retry will retry the provided function up to maxRetries times.
+// It returns true if the function failed after all retries, false otherwise.
+func (r *Retryer) Retry(batch []byte, msgCount float64, funcToRetry func([]byte, float64) error) (failed bool) {
 	var err error
 
 	// First attempt (fast path, not counted as a retry)
 	err = funcToRetry(batch, msgCount)
 	if err == nil {
-		return
+		return false
 	}
 
 	if egress.ContextDone(r.binding.Context) {
 		log.Printf("Context cancelled for %s, aborting retries", r.binding.URL.Host)
-		return
+		return true
 	}
 
-	log.Printf("failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(0), err)
+	log.Printf("Failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(0), err)
 
 	for i := 0; i < r.maxRetries-1; i++ {
 
 		if egress.ContextDone(r.binding.Context) {
 			log.Printf("Context cancelled for %s, aborting retries", r.binding.URL.Host)
-			return
+			return true
 		}
 
 		sleepDuration := r.retryDuration(i)
 		time.Sleep(sleepDuration)
 
-		r.coordinator.Acquire()
+		r.coordinator.Acquire(r.binding.URL.Host)
 		func() {
 			defer r.coordinator.Release()
 			err = funcToRetry(batch, msgCount)
 		}()
 		if err == nil {
-			return
+			return false
 		}
-		log.Printf("failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(i+1), err)
+		log.Printf("Failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(i+1), err)
 
 	}
 
-	log.Printf("Exhausted retries for %s, dropping batch, err: %s", r.binding.URL.Host, err)
+	log.Printf("Exhausted retries for %s, dropping batch with %.0f messages, err: %s",
+		r.binding.URL.Host, msgCount, err)
+	return true
 }
 
 type HTTPSBatchWriter struct {
@@ -190,7 +189,7 @@ func NewHTTPSBatchWriter(
 			syslogConverter: c,
 		},
 		retryer:      *NewRetryer(binding, ExponentialDuration, 5),
-		batchSize:    256 * 1024,        // Default value
+		batchSize:    512 * 1024,        // Default value
 		sendInterval: 1 * time.Second,   // Default value
 		msgChan:      make(chan []byte), // blocking single message channel for backpressure
 		quit:         make(chan struct{}),
@@ -231,7 +230,12 @@ func (w *HTTPSBatchWriter) startSender() {
 
 	sendBatch := func() {
 		if msgBatch.Len() > 0 {
-			w.retryer.Retry(msgBatch.Bytes(), msgCount, w.sendHttpRequest)
+			failed := w.retryer.Retry(msgBatch.Bytes(), msgCount, w.sendHttpRequest)
+			if failed && msgCount > 0 {
+				log.Printf("Failed to deliver %.0f messages to %s after all retries, dropping batch",
+					msgCount, w.url.Host)
+				// You could also emit a metric here if you have a metrics client
+			}
 			msgBatch.Reset()
 			msgCount = 0
 		}
