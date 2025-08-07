@@ -56,9 +56,11 @@ func (c *RetryCoordinator) StartAsyncMonitor() {
 		defer ticker.Stop()
 		for {
 			<-ticker.C
-			open := len(c.sem)
+			used := len(c.sem)
 			capacity := cap(c.sem)
-			log.Printf("[RetryCoordinator %p] Open retries: %d/%d", c, open, capacity)
+			available := capacity - used
+			log.Printf("[RetryCoordinator %p] Retry slots: %d used, %d available (capacity: %d)",
+				c, used, available, capacity)
 		}
 	}()
 }
@@ -80,7 +82,7 @@ func NewRetryer(
 	maxRetries int,
 ) *Retryer {
 	return &Retryer{
-		retryDuration: func(attempt int) time.Duration { return 0 },
+		retryDuration: retryDuration,
 		maxRetries:    maxRetries,
 		binding:       binding,
 		coordinator:   GetGlobalRetryCoordinator(),
@@ -110,6 +112,9 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, funcToRetry func([]byte,
 			return
 		}
 
+		sleepDuration := r.retryDuration(i)
+		time.Sleep(sleepDuration)
+
 		r.coordinator.Acquire()
 		func() {
 			defer r.coordinator.Release()
@@ -119,8 +124,7 @@ func (r *Retryer) Retry(batch []byte, msgCount float64, funcToRetry func([]byte,
 			return
 		}
 		log.Printf("failed to write to %s, retrying in %s, err: %s", r.binding.URL.Host, r.retryDuration(i+1), err)
-		sleepDuration := r.retryDuration(i)
-		time.Sleep(sleepDuration)
+
 	}
 
 	log.Printf("Exhausted retries for %s, dropping batch, err: %s", r.binding.URL.Host, err)
@@ -185,7 +189,7 @@ func NewHTTPSBatchWriter(
 			egressMetric:    egressMetric,
 			syslogConverter: c,
 		},
-		retryer:      *NewRetryer(binding, func(attempt int) time.Duration { return 0 }, 0),
+		retryer:      *NewRetryer(binding, ExponentialDuration, 5),
 		batchSize:    256 * 1024,        // Default value
 		sendInterval: 1 * time.Second,   // Default value
 		msgChan:      make(chan []byte), // blocking single message channel for backpressure
