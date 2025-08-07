@@ -106,7 +106,7 @@ func (*HTTPSWriter) Close() error {
 
 func httpClient(_ NetworkTimeoutConfig, tlsConf *tls.Config) *fasthttp.Client {
 	return &fasthttp.Client{
-		MaxConnsPerHost:     5,
+		MaxConnsPerHost:     50,
 		MaxIdleConnDuration: 90 * time.Second,
 		TLSConfig:           tlsConf,
 		ReadTimeout:         20 * time.Second,
