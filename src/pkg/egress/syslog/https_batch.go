@@ -230,12 +230,21 @@ func (w *HTTPSBatchWriter) startSender() {
 
 	sendBatch := func() {
 		if msgBatch.Len() > 0 {
-			failed := w.retryer.Retry(msgBatch.Bytes(), msgCount, w.sendHttpRequest)
-			if failed && msgCount > 0 {
-				log.Printf("Failed to deliver %.0f messages to %s after all retries, dropping batch",
-					msgCount, w.url.Host)
-				// You could also emit a metric here if you have a metrics client
-			}
+			// Make a copy of the batch data since we're going to reset the buffer
+			batchCopy := make([]byte, msgBatch.Len())
+			copy(batchCopy, msgBatch.Bytes())
+			msgCountCopy := msgCount
+
+			// Start retry in a separate goroutine
+			go func(data []byte, count float64) {
+				failed := w.retryer.Retry(data, count, w.sendHttpRequest)
+				if failed && count > 0 {
+					log.Printf("Failed to deliver %.0f messages to %s after all retries, dropping batch",
+						count, w.url.Host)
+				}
+			}(batchCopy, msgCountCopy)
+
+			// Reset buffer immediately so the main loop can continue
 			msgBatch.Reset()
 			msgCount = 0
 		}
